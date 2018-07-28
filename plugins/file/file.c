@@ -33,6 +33,7 @@
 
 #include <config.h>
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,9 +42,11 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <sys/ioctl.h>
 
 #if defined(__linux__)
 #include <linux/falloc.h>   /* For FALLOC_FL_* on RHEL, glibc < 2.18 */
+#include <linux/fs.h>       /* For BLKZEROOUT */
 #endif
 
 #include <nbdkit-plugin.h>
@@ -119,6 +122,10 @@ file_config_complete (void)
 /* The per-connection handle. */
 struct handle {
   int fd;
+  bool is_block_device;
+  bool can_punch_hole;
+  bool can_zero_range;
+  bool can_fallocate;
 };
 
 /* Create the per-connection handle. */
@@ -126,6 +133,7 @@ static void *
 file_open (int readonly)
 {
   struct handle *h;
+  struct stat statbuf;
   int flags;
 
   h = malloc (sizeof *h);
@@ -147,6 +155,23 @@ file_open (int readonly)
     return NULL;
   }
 
+  if (fstat (h->fd, &statbuf) == -1) {
+    nbdkit_error ("fstat: %s: %m", filename);
+    free (h);
+    return NULL;
+  }
+
+  h->is_block_device = S_ISBLK(statbuf.st_mode);
+
+  /* These flags will disabled if an operation is not supported. */
+#ifdef FALLOC_FL_PUNCH_HOLE
+  h->can_punch_hole = true;
+#endif
+#ifdef FALLOC_FL_ZERO_RANGE
+  h->can_zero_range = true;
+#endif
+  h->can_fallocate = true;
+
   return h;
 }
 
@@ -167,27 +192,29 @@ static int64_t
 file_get_size (void *handle)
 {
   struct handle *h = handle;
-  struct stat statbuf;
 
-  if (fstat (h->fd, &statbuf) == -1) {
-    nbdkit_error ("stat: %m");
-    return -1;
-  }
-
-  if (S_ISBLK (statbuf.st_mode)) {
+  if (h->is_block_device) {
+    /* Block device, so st_size will not be the true size. */
     off_t size;
 
-    /* Block device, so st_size will not be the true size. */
     size = lseek (h->fd, 0, SEEK_END);
     if (size == -1) {
       nbdkit_error ("lseek (to find device size): %m");
       return -1;
     }
-    return size;
-  }
 
-  /* Else regular file. */
-  return statbuf.st_size;
+    return size;
+  } else {
+    /* Regular file. */
+    struct stat statbuf;
+
+    if (fstat (h->fd, &statbuf) == -1) {
+      nbdkit_error ("fstat: %m");
+      return -1;
+    }
+
+    return statbuf.st_size;
+  }
 }
 
 static int
@@ -253,33 +280,86 @@ file_pwrite (void *handle, const void *buf, uint32_t count, uint64_t offset)
 static int
 file_zero (void *handle, uint32_t count, uint64_t offset, int may_trim)
 {
-#if defined(FALLOC_FL_PUNCH_HOLE) || defined(FALLOC_FL_ZERO_RANGE)
   struct handle *h = handle;
-#endif
   int r = -1;
 
 #ifdef FALLOC_FL_PUNCH_HOLE
-  if (may_trim) {
+  /* If we can and may trim, punching hole is our best option. */
+  if (h->can_punch_hole && may_trim) {
     r = do_fallocate (h->fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
                       offset, count);
-    if (r == -1 && errno != EOPNOTSUPP) {
+    if (r == 0)
+        return 0;
+
+    if (errno != EOPNOTSUPP) {
       nbdkit_error ("zero: %m");
+      return r;
     }
-    /* PUNCH_HOLE is older; if it is not supported, it is likely that
-       ZERO_RANGE will not work either, so fall back to write. */
-    return r;
+
+    h->can_punch_hole = false;
   }
 #endif
 
 #ifdef FALLOC_FL_ZERO_RANGE
-  r = do_fallocate (h->fd, FALLOC_FL_ZERO_RANGE, offset, count);
-  if (r == -1 && errno != EOPNOTSUPP) {
-    nbdkit_error ("zero: %m");
+  /* ZERO_RANGE is not well supported yet, but it the next best option. */
+  if (h->can_zero_range) {
+    r = do_fallocate (h->fd, FALLOC_FL_ZERO_RANGE, offset, count);
+    if (r == 0)
+      return 0;
+
+    if (errno != EOPNOTSUPP) {
+      nbdkit_error ("zero: %m");
+      return r;
+    }
+
+    h->can_zero_range = false;
   }
-#else
+#endif
+
+#ifdef FALLOC_FL_PUNCH_HOLE
+  /* If we can punch hole but may not trim, we can combine punching hole and
+     fallocate to zero a range. This is much more efficient than writing zeros
+     manually. */
+  if (h->can_punch_hole && h->can_fallocate) {
+    r = do_fallocate (h->fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                      offset, count);
+    if (r == 0) {
+      r = do_fallocate(h->fd, 0, offset, count);
+      if (r == 0)
+        return 0;
+
+      if (errno != EOPNOTSUPP) {
+        nbdkit_error ("zero: %m");
+        return r;
+      }
+
+      h->can_fallocate = false;
+    } else {
+      if (errno != EOPNOTSUPP) {
+        nbdkit_error ("zero: %m");
+        return r;
+      }
+
+      h->can_punch_hole = false;
+    }
+  }
+#endif
+
+  /* For block devices, we can use BLKZEROOUT.
+     NOTE: count and offset must be aligned to logical block size. */
+  if (h->is_block_device) {
+    uint64_t range[2] = {offset, count};
+
+    r = ioctl(h->fd, BLKZEROOUT, &range);
+    if (r == 0)
+      return 0;
+
+    nbdkit_error("zero: %m");
+    return r;
+  }
+
   /* Trigger a fall back to writing */
   errno = EOPNOTSUPP;
-#endif
 
   return r;
 }
