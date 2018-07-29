@@ -42,6 +42,10 @@
 #include <sys/stat.h>
 #include <errno.h>
 
+#if defined(__linux__)
+#include <linux/falloc.h>   /* For FALLOC_FL_* on RHEL, glibc < 2.18 */
+#endif
+
 #include <nbdkit-plugin.h>
 
 #ifndef O_CLOEXEC
