@@ -80,7 +80,7 @@ nbdkit_LDFLAGS = \
 # used to generate the man page.
 
 EXTRA_DIST = synopsis.c
-nbdkit_DEPENDENCIES = synopsis.c
+main.c: synopsis.c
 synopsis.c: $(top_srcdir)/docs/synopsis.txt
 	rm -f $@ $@-t
 	$(SED) -e 's/\(.*\)/"\1\\n"/g' $< > $@-t
